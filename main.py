@@ -23,7 +23,7 @@ CONFIG = {
     'API_KEY': os.getenv('BITHUMB_ACCESS_KEY_2'),
     'SECRET_KEY': os.getenv('BITHUMB_SECRET_KEY_2'),
     'API_URL': 'https://api.bithumb.com',
-    'TICKER': 'BTC',
+    'TICKER': 'ETH',
     'ORDER_AMOUNT_KRW': 50000,
     'CHECK_INTERVAL': 5,
     'MAIN_LOOP_INTERVAL': 60,
@@ -70,6 +70,8 @@ class BithumbAPI:
                     response = requests.get(url, headers=headers, params=params)
                 elif method == 'POST':
                     response = requests.post(url, headers=headers, data=json.dumps(params))
+                elif method == 'DELETE':
+                    response = requests.delete(url, headers=headers, params=params)
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.RequestException as e:
@@ -183,12 +185,18 @@ class BithumbAPI:
 
     def cancel_order(self, order_uuid: str) -> bool:
         params = {"uuid": order_uuid}
-        response = self.api_call('POST', '/v1/order', params)
-        if response and 'data' in response:
-            return True
+        response = self.api_call('DELETE', '/v1/order', params)
+        if response and isinstance(response, dict):
+            if response.get('status') == '0000':  # 성공 상태 코드 확인
+                logger.info(f"Successfully canceled order: {order_uuid}")
+                return True
+            else:
+                logger.error(f"Failed to cancel order: {response}")
+                return False
         else:
-            logger.error(f"Failed to cancel order: {response}")
+            logger.error(f"Unexpected response format: {response}")
             return False
+        
     def get_candlestick(self, ticker: str, interval: str = "10m", count: int = 200) -> Optional[List[Dict[str, Any]]]:
         interval_map = {"1m": 1, "3m": 3, "5m": 5, "10m": 10, "15m": 15, "30m": 30, "60m": 60, "240m": 240}
         minutes = interval_map.get(interval, 10)
@@ -302,28 +310,51 @@ class BithumbTrader:
         executed_volume = float(final_order_status['executed_volume'])
         remaining_volume = float(final_order_status['remaining_volume'])
         
-        if executed_volume > 0:
-            logger.info(f"Partial execution after 2 minutes. Executed volume: {executed_volume}")
-            self.api.cancel_order(order_uuid)
+        if executed_volume == units:
+            # 1. 모두 전체 체결됐을 경우
+            logger.info(f"Order fully executed. Executed volume: {executed_volume}")
             return limit_price, executed_volume
         
-        # If not executed or partially executed, place a market order for the remaining amount
-        self.api.cancel_order(order_uuid)
-        remaining_amount = self.config['ORDER_AMOUNT_KRW'] - (executed_volume * limit_price)
-        current_price = orderbook['orderbook_units'][0]['ask_price']
-        market_units = remaining_amount / current_price * (1.0 - self.trading_config['fee'])
+        # Cancel the remaining order only if it's not fully executed
+        if remaining_volume > 0:
+            try:
+                cancel_result = self.api.cancel_order(order_uuid)
+                if not cancel_result:
+                    logger.warning(f"Failed to cancel order: {order_uuid}")
+            except Exception as e:
+                logger.error(f"Error while cancelling order: {e}")
         
-        market_order = self.api.place_order(ticker, "bid", current_price, market_units, ord_type='market')
-        if market_order:
-            logger.info(f"Placed market buy order for remaining amount: {market_order}")
-            total_executed_volume = executed_volume + float(market_order['executed_volume'])
-            average_price = (executed_volume * limit_price + float(market_order['executed_volume']) * current_price) / total_executed_volume
-            return average_price, total_executed_volume
+        if executed_volume > 0:
+            # 2. 일부 체결된 경우
+            logger.info(f"Partial execution. Executed volume: {executed_volume}")
+            remaining_amount = self.config['ORDER_AMOUNT_KRW'] - (executed_volume * limit_price)
         else:
-            logger.error("Failed to place market order for remaining amount")
+            # 3. 모두 체결 안된 경우
+            logger.info("Order not executed. Placing full market order.")
+            remaining_amount = self.config['ORDER_AMOUNT_KRW']
+        
+        # Place market order for remaining amount
+        try:
+            current_price = self.api.get_orderbook(ticker)['orderbook_units'][0]['ask_price']
+            market_units = remaining_amount / current_price * (1.0 - self.trading_config['fee'])
+            
+            market_order = self.api.place_order(ticker, "bid", current_price, market_units, ord_type='market')
+            if market_order:
+                logger.info(f"Placed market buy order for remaining amount: {market_order}")
+                market_executed_volume = float(market_order['executed_volume'])
+                total_executed_volume = executed_volume + market_executed_volume
+                average_price = ((executed_volume * limit_price) + (market_executed_volume * current_price)) / total_executed_volume
+                return average_price, total_executed_volume
+            else:
+                logger.error("Failed to place market order for remaining amount")
+        except Exception as e:
+            logger.error(f"Error while placing market order: {e}")
+        
+        # If market order failed or caused an exception
+        if executed_volume > 0:
             return limit_price, executed_volume  # Return partial execution result
-
-        return None, 0  # All attempts failed
+        else:
+            return None, 0  # Return failure if no execution at all
 
     def sell_coin(self, ticker: str, buy_price: float, units: float) -> bool:
         orderbook = self.api.get_orderbook(ticker)
